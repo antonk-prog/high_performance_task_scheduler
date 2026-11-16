@@ -1,0 +1,53 @@
+cmake_minimum_required(VERSION 3.16)
+project(task_scheduler VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(TASK_SCHEDULER_ASAN_UBSAN "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(TASK_SCHEDULER_TSAN "Enable ThreadSanitizer (separate build)" OFF)
+
+if(TASK_SCHEDULER_ASAN_UBSAN AND TASK_SCHEDULER_TSAN)
+    message(FATAL_ERROR "ASan and TSan require separate builds")
+endif()
+
+add_library(scheduler_options INTERFACE)
+if(MSVC)
+    target_compile_options(scheduler_options INTERFACE /W4 /permissive-)
+else()
+    target_compile_options(scheduler_options INTERFACE -Wall -Wextra -Wpedantic)
+endif()
+
+if(TASK_SCHEDULER_ASAN_UBSAN OR TASK_SCHEDULER_TSAN)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR "Sanitizer options require GCC or Clang")
+    endif()
+    if(TASK_SCHEDULER_ASAN_UBSAN)
+        set(SANITIZERS -fsanitize=address,undefined)
+    else()
+        set(SANITIZERS -fsanitize=thread)
+    endif()
+    target_compile_options(scheduler_options INTERFACE ${SANITIZERS} -fno-omit-frame-pointer)
+    target_link_options(scheduler_options INTERFACE ${SANITIZERS})
+endif()
+
+find_package(Threads REQUIRED)
+add_library(task_scheduler src/thread_pool.cpp)
+target_include_directories(task_scheduler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_features(task_scheduler PUBLIC cxx_std_17)
+target_link_libraries(task_scheduler PUBLIC Threads::Threads scheduler_options)
+
+add_executable(scheduler_example src/examples/basic.cpp)
+target_link_libraries(scheduler_example PRIVATE task_scheduler)
+
+add_executable(scheduler_benchmark src/benchmarks/throughput.cpp)
+target_link_libraries(scheduler_benchmark PRIVATE task_scheduler)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(scheduler_tests src/tests/scheduler_tests.cpp)
+    target_link_libraries(scheduler_tests PRIVATE task_scheduler)
+    add_test(NAME scheduler_tests COMMAND scheduler_tests)
+    set_tests_properties(scheduler_tests PROPERTIES TIMEOUT 120)
+endif()
