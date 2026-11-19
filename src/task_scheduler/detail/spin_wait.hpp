@@ -12,9 +12,8 @@ namespace detail {
 class SpinWait {
 public:
     void pause() noexcept {
-        if (++attempts_ >= 64) {
+        if (attempts_++ >= 32) {
             std::this_thread::yield();
-            attempts_ = 0;
             return;
         }
 #if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)

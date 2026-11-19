@@ -12,6 +12,16 @@ namespace detail {
 
 // push/pop: только владелец. steal: любое количество других потоков.
 // Кольцо не растёт: это позволяет обойтись без reclamation старых буферов.
+// Порядки памяти (включая C++20):
+// slots: release/acquire публикуют задачу; TSan не моделирует публикацию через fence.
+// bottom: owner loads/stores relaxed, кроме публикации push (release fence + store).
+// Release fence перед push-store синхронизируется с acquire-load bottom в steal,
+// даже если тот читает последующую relaxed-запись pop (fence-atomic synchronization).
+// top: acquire в push/steal принимает продвижение воров; relaxed в pop после SC fence.
+// SC fences в pop/steal + SC CAS задают общий порядок спора за последний элемент.
+// CAS failure relaxed: проигравший не использует слот; восстановления bottom relaxed
+// достаточно, поскольку его пишет только владелец и fence публикации уже выполнен.
+// Инициализация slots relaxed происходит до запуска потоков.
 template <class T>
 class ChaseLevDeque {
 public:
@@ -35,9 +45,10 @@ public:
             return false;
         }
 
-        slot(bottom).store(item, std::memory_order_relaxed);
+        slot(bottom).store(item, std::memory_order_release);
         // Публикуем и указатель, и содержимое задачи.
-        bottom_.store(bottom + 1, std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_release);
+        bottom_.store(bottom + 1, std::memory_order_relaxed);
         return true;
     }
 
@@ -53,7 +64,7 @@ public:
             return nullptr;
         }
 
-        auto* item = slot(bottom).load(std::memory_order_relaxed);
+        auto* item = slot(bottom).load(std::memory_order_acquire);
         if (top == bottom) {
             // За последний item владелец тоже борется через CAS.
             if (!top_.compare_exchange_strong(top, top + 1,
@@ -76,7 +87,7 @@ public:
 
         // Слот может быть переиспользован, пока вор остановлен перед CAS.
         // Поэтому сам слот атомарный, а item нельзя разыменовать до успеха CAS.
-        auto* item = slot(top).load(std::memory_order_relaxed);
+        auto* item = slot(top).load(std::memory_order_acquire);
         if (!top_.compare_exchange_strong(top, top + 1,
                                          std::memory_order_seq_cst,
                                          std::memory_order_relaxed)) {

@@ -8,6 +8,7 @@ namespace detail {
 
 struct Task {
     Task* next = nullptr; // Используется только входящей очередью.
+    Task* inbox_tail = nullptr; // Хвост опубликованного сегмента.
     virtual ~Task() = default;
     virtual void run() = 0;
 };

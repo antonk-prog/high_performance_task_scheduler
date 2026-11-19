@@ -6,7 +6,11 @@
 
 #include <atomic>
 #include <cstddef>
+#include <condition_variable>
+#include <future>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -28,14 +32,42 @@ public:
     ThreadPool& operator=(ThreadPool&&) = delete;
 
     // Допускает одновременные вызовы из внешних потоков и из задач пула.
-    // Возвращаемое callable значение игнорируется. Исключения считаются в failed_tasks().
     template <class F>
-    void submit(F&& function) {
+    auto submit(F&& function) -> std::future<std::invoke_result_t<std::decay_t<F>&>> {
         using Function = std::decay_t<F>;
+        using Result = std::invoke_result_t<Function&>;
         static_assert(std::is_invocable_v<Function&>, "task must be callable without arguments");
-        auto task = std::make_unique<detail::CallableTask<Function>>(
-            std::forward<F>(function));
+        std::packaged_task<Result()> packaged(
+            [this, fn = Function(std::forward<F>(function))]() mutable -> Result {
+                try {
+                    return std::invoke(fn);
+                } catch (...) {
+                    failed_tasks_.fetch_add(1, std::memory_order_relaxed);
+                    throw;
+                }
+            });
+        auto result = packaged.get_future();
+        auto task = std::make_unique<detail::CallableTask<decltype(packaged)>>(std::move(packaged));
         enqueue(std::move(task));
+        return result;
+    }
+
+    // В worker-е ожидание помогает пулу; get() вызывается отдельно для результата.
+    template <class T>
+    void wait(std::future<T>& future) {
+        if (current_pool_ != this) {
+            future.wait();
+            return;
+        }
+        for (;;) {
+            const auto status = future.wait_for(std::chrono::seconds(0));
+            if (status == std::future_status::ready) return;
+            if (status == std::future_status::deferred) { future.wait(); return; }
+            if (!help_one()) {
+                // Ожидаемый результат может быть опубликован без новой задачи.
+                future.wait_for(std::chrono::milliseconds(1));
+            }
+        }
     }
 
     // Только для внешнего потока. Включает дочерние задачи.
@@ -53,11 +85,15 @@ private:
 
         detail::ChaseLevDeque<detail::Task> local;
         detail::Inbox inbox;
-        detail::Task* batch = nullptr; // Только для владельца, уже отсоединён от inbox.
+        std::size_t victim_start = 0;
+        unsigned ticks = 0;
     };
 
     void enqueue(std::unique_ptr<detail::Task> task) noexcept;
-    void refill_local(Worker& worker) noexcept;
+    detail::Task* take_inbox(Worker& worker, detail::Inbox& inbox) noexcept;
+    detail::Task* find_work(std::size_t index) noexcept;
+    bool help_one() noexcept;
+    void signal_work(bool all = false) noexcept;
     void run_worker(std::size_t index) noexcept;
     void execute(detail::Task* task) noexcept;
 
@@ -72,9 +108,54 @@ private:
     alignas(64) std::atomic<std::size_t> next_worker_{0};
     alignas(64) std::atomic<std::size_t> failed_tasks_{0};
     alignas(64) std::atomic<bool> stopping_{false};
+    mutable std::mutex park_mutex_;
+    mutable std::condition_variable park_cv_;
+    std::atomic<std::size_t> wake_epoch_{0};
+    std::size_t sleepers_ = 0; // Только под park_mutex_.
 
     static thread_local ThreadPool* current_pool_;
     static thread_local std::size_t current_worker_;
+};
+
+// Один управляющий поток на группу; пул должен пережить группу.
+class TaskGroup {
+public:
+    explicit TaskGroup(ThreadPool& pool) : pool_(pool) {}
+    TaskGroup(const TaskGroup&) = delete;
+    TaskGroup& operator=(const TaskGroup&) = delete;
+    ~TaskGroup() { try { wait(); } catch (...) {} }
+
+    template <class F>
+    void submit(F&& function) {
+        futures_.emplace_back(); // Выделяем память до принятия задачи пулом.
+        try {
+            futures_.back() = pool_.submit(
+                [fn = std::decay_t<F>(std::forward<F>(function))]() mutable {
+                    std::invoke(fn);
+                });
+        } catch (...) {
+            futures_.pop_back();
+            throw;
+        }
+    }
+
+    void wait() {
+        std::exception_ptr failure;
+        for (auto& future : futures_) {
+            try {
+                pool_.wait(future);
+                future.get();
+            } catch (...) {
+                if (!failure) failure = std::current_exception();
+            }
+        }
+        futures_.clear();
+        if (failure) std::rethrow_exception(failure);
+    }
+
+private:
+    ThreadPool& pool_;
+    std::vector<std::future<void>> futures_;
 };
 
 } // namespace task_scheduler

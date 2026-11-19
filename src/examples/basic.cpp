@@ -25,13 +25,10 @@ int main() {
 
     std::cout << "Sum: " << std::accumulate(values.begin(), values.end(), 0LL) << '\n';
 
-    int answer = 0;
-    pool.submit([&pool, &answer] {
-        // Из worker-а задача попадёт в его локальную Chase-Lev deque.
-        pool.submit([value = std::make_unique<int>(42), &answer] {
-            answer = *value;
-        });
+    auto answer = pool.submit([&pool] {
+        auto child = pool.submit([value = std::make_unique<int>(42)] { return *value; });
+        pool.wait(child);
+        return child.get();
     });
-    pool.wait_idle(); // Дожидается и родительской, и дочерней задачи.
-    std::cout << "Nested task: " << answer << '\n';
+    std::cout << "Nested task: " << answer.get() << '\n';
 }

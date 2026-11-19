@@ -24,6 +24,7 @@ ThreadPool::ThreadPool(std::size_t thread_count, std::size_t queue_capacity) {
     // Все очереди должны существовать до запуска первого вора.
     for (std::size_t i = 0; i < thread_count; ++i) {
         workers_.push_back(std::make_unique<Worker>(queue_capacity));
+        workers_.back()->victim_start = i;
     }
 
     try {
@@ -32,6 +33,7 @@ ThreadPool::ThreadPool(std::size_t thread_count, std::size_t queue_capacity) {
         }
     } catch (...) {
         stopping_.store(true, std::memory_order_release);
+        signal_work(true);
         for (auto& thread : threads_) {
             thread.join();
         }
@@ -47,9 +49,18 @@ ThreadPool::~ThreadPool() {
     // Внешние producers к этому моменту уже должны завершиться.
     // Работающие задачи всё ещё могут добавлять дочерние задачи.
     stopping_.store(true, std::memory_order_release);
+    signal_work(true);
     for (auto& thread : threads_) {
         thread.join();
     }
+}
+
+void ThreadPool::signal_work(bool all) noexcept {
+    // Мьютекс закрывает окно между проверкой предиката и фактическим wait.
+    std::lock_guard<std::mutex> lock(park_mutex_);
+    wake_epoch_.fetch_add(1, std::memory_order_release);
+    if (all) park_cv_.notify_all();
+    else if (sleepers_ != 0) park_cv_.notify_one();
 }
 
 void ThreadPool::enqueue(std::unique_ptr<detail::Task> task) noexcept {
@@ -63,87 +74,99 @@ void ThreadPool::enqueue(std::unique_ptr<detail::Task> task) noexcept {
             worker.inbox.push(raw_task);
         }
     } else {
+        // Только распределение нагрузки, не публикация данных.
         const auto index = next_worker_.fetch_add(1, std::memory_order_relaxed)
                            % workers_.size();
         workers_[index]->inbox.push(raw_task);
     }
+    // В том числе локальный push: дети нужны припаркованным ворам.
+    signal_work();
 }
 
-void ThreadPool::refill_local(Worker& worker) noexcept {
-    if (worker.batch == nullptr) {
-        worker.batch = worker.inbox.take_all();
+detail::Task* ThreadPool::take_inbox(Worker& worker, detail::Inbox& inbox) noexcept {
+    detail::Task* last = nullptr;
+    auto* list = inbox.take_all(&last);
+    if (list == nullptr) return nullptr;
+    auto* result = list;
+    list = list->next;
+    for (unsigned n = 0; n < 32 && list != nullptr; ++n) {
+        auto* next = list->next; // До публикации: после push узел может быть удалён.
+        if (!worker.local.push(list)) break;
+        list = next;
     }
+    if (list != nullptr) {
+        inbox.push_list(list, last);
+        signal_work();
+    }
+    return result;
+}
 
-    // Ограничиваем batch, чтобы не задерживать выполнение и кражу задач.
-    for (unsigned i = 0; i < 32 && worker.batch != nullptr; ++i) {
-        auto* task = worker.batch;
-        auto* next = task->next;
-        if (!worker.local.push(task)) {
-            break;
-        }
-        // После push задача уже может быть выполнена и удалена вором.
-        worker.batch = next;
+detail::Task* ThreadPool::find_work(std::size_t index) noexcept {
+    auto& worker = *workers_[index];
+    // Периодическая проверка inbox исключает голодание внешних задач.
+    if (++worker.ticks == 32) {
+        worker.ticks = 0;
+        if (auto* task = take_inbox(worker, worker.inbox)) return task;
     }
+    if (auto* task = worker.local.pop()) return task;
+    if (auto* task = take_inbox(worker, worker.inbox)) return task;
+    worker.victim_start = (worker.victim_start + 1) % workers_.size();
+    for (std::size_t n = 0; n < workers_.size(); ++n) {
+        const auto victim = (worker.victim_start + n) % workers_.size();
+        if (victim == index) continue;
+        if (auto* task = workers_[victim]->local.steal()) return task;
+        if (auto* task = take_inbox(worker, workers_[victim]->inbox)) return task;
+    }
+    return nullptr;
 }
 
 void ThreadPool::execute(detail::Task* task) noexcept {
     {
         std::unique_ptr<detail::Task> owned_task(task);
-        try {
-            owned_task->run();
-        } catch (...) {
-            failed_tasks_.fetch_add(1, std::memory_order_relaxed);
-        }
+        owned_task->run();
     }
     // acq_rel связывает результаты ВСЕХ завершённых задач с wait_idle().
     // Деструктор callable тоже должен закончиться до уменьшения счётчика.
-    outstanding_.fetch_sub(1, std::memory_order_acq_rel);
+    if (outstanding_.fetch_sub(1, std::memory_order_acq_rel) == 1) signal_work(true);
+}
+
+bool ThreadPool::help_one() noexcept {
+    if (auto* task = find_work(current_worker_)) {
+        execute(task);
+        return true;
+    }
+    return false;
 }
 
 void ThreadPool::run_worker(std::size_t index) noexcept {
     current_pool_ = this;
     current_worker_ = index;
-    auto& worker = *workers_[index];
     detail::SpinWait idle;
-    unsigned ticks = 0;
-    std::size_t victim_start = index;
+    unsigned misses = 0;
 
     for (;;) {
-        // Даже при непрерывной локальной работе проверяем внешние задачи.
-        if (++ticks == 32) {
-            refill_local(worker);
-            ticks = 0;
-        }
-
-        auto* task = worker.local.pop();
-        if (task == nullptr) {
-            refill_local(worker);
-            task = worker.local.pop();
-        }
-        if (task == nullptr) {
-            // Сдвигаем начало обхода, чтобы все воры не били в одну очередь.
-            victim_start = (victim_start + 1) % workers_.size();
-            for (std::size_t n = 0; n < workers_.size(); ++n) {
-                const auto victim = (victim_start + n) % workers_.size();
-                if (victim != index) {
-                    task = workers_[victim]->local.steal();
-                    if (task != nullptr) {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (task != nullptr) {
+        // Обязательно ДО поиска: иначе submit между поиском и снимком будет потерян.
+        const auto epoch = wake_epoch_.load(std::memory_order_acquire);
+        if (help_one()) {
+            misses = 0;
             idle.reset();
-            execute(task);
-        } else {
-            if (stopping_.load(std::memory_order_acquire) &&
-                outstanding_.load(std::memory_order_acquire) == 0) {
-                break;
-            }
-            idle.pause();
+            continue;
         }
+        if (stopping_.load(std::memory_order_acquire) &&
+            outstanding_.load(std::memory_order_acquire) == 0) {
+            break;
+        }
+        if (++misses < 40) { idle.pause(); continue; }
+        std::unique_lock<std::mutex> lock(park_mutex_);
+        ++sleepers_;
+        park_cv_.wait(lock, [&] {
+            return wake_epoch_.load(std::memory_order_acquire) != epoch ||
+                (stopping_.load(std::memory_order_acquire) &&
+                 outstanding_.load(std::memory_order_acquire) == 0);
+        });
+        --sleepers_;
+        misses = 0;
+        idle.reset();
     }
 
     current_pool_ = nullptr;
@@ -153,10 +176,8 @@ void ThreadPool::wait_idle() const {
     if (current_pool_ == this) {
         throw std::logic_error("wait_idle cannot be called from this pool's task");
     }
-    detail::SpinWait idle;
-    while (outstanding_.load(std::memory_order_acquire) != 0) {
-        idle.pause();
-    }
+    std::unique_lock<std::mutex> lock(park_mutex_);
+    park_cv_.wait(lock, [&] { return outstanding_.load(std::memory_order_acquire) == 0; });
 }
 
 } // namespace task_scheduler
